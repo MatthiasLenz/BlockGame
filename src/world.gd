@@ -4,14 +4,27 @@ const WORLD_RADIUS := 40
 const WORLD_EXPANSION_TRIGGER := 16
 const WORLD_EXPANSION_SIZE := 16
 @export_range(0, 64) var max_height := 4
+# Globale maximale Wasserhoehe (Y-Ebene des obersten Wasserblocks); wirkt nur auf neu generierte Bereiche.
+@export_range(-1, 64) var water_level := 4
+@export_range(0.0, 20.0, 0.1) var swim_speed := 3.5
+@export_range(0.0, 20.0, 0.1) var water_sink_speed := 2.5
 const BLOCK_SIZE := 1.0
 const PLAYER_SCALE := 1.0
 const BEDROCK_Y := -2
 const BEDROCK_COLOR := Color(0.28, 0.29, 0.3)
+const GRASS_COLOR := Color(0.35, 0.7, 0.32)
+const HILL_COLOR := Color(0.45, 0.62, 0.38)
+const ROCK_COLOR := Color(0.6, 0.5, 0.38)
+const DIRT_COLOR := Color(0.47, 0.33, 0.2)
+const WATER_COLOR := Color(0.2, 0.45, 0.85, 0.55)
+const WATER_GRAVITY_FACTOR := 0.3
+const BLOCK_TEXTURE_VARIANTS := 256
 
 var blocks: Dictionary = {}
+var water_blocks: Dictionary = {}
+var water_material: StandardMaterial3D
 var block_mesh: BoxMesh
-var block_texture: ImageTexture
+var block_textures: Dictionary = {}
 var block_materials: Dictionary = {}
 var world_min_x := -WORLD_RADIUS
 var world_max_x := WORLD_RADIUS
@@ -52,7 +65,7 @@ var health := MAX_HEARTS
 var hearts: Array[Control] = []
 
 # Linke Hand: Bloecke zum Platzieren, rechte Hand: Werkzeuge (nur Anzeige)
-var left_items: Array[Color] = [Color(0.35, 0.7, 0.32), Color(0.45, 0.62, 0.38), Color(0.6, 0.5, 0.38), Color(0.35, 0.55, 0.28)]
+var left_items: Array[Color] = [GRASS_COLOR, HILL_COLOR, ROCK_COLOR, DIRT_COLOR]
 var right_items: Array[String] = ["Hand", "Pick", "Axt", "Schwert"]
 var left_selected := 0
 var right_selected := 0
@@ -226,7 +239,7 @@ func _update_hand() -> void:
 	var box := BoxMesh.new()
 	if show_block:
 		box.size = Vector3(0.28, 0.28, 0.28)
-		mat.albedo_texture = _get_block_texture()
+		mat.albedo_texture = _get_block_texture(0, left_items[left_selected] == DIRT_COLOR)
 		mat.albedo_color = left_items[left_selected]
 		mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 		hand.rotation_degrees = Vector3(0.0, 30.0, 0.0)
@@ -421,7 +434,7 @@ func _start_next_world_generation() -> void:
 		return
 	var region: Vector4i = generation_queue.pop_front()
 	generation_thread_running = true
-	var error: Error = generation_thread.start(_generate_world_region_data.bind(region, terrain_seed, max_height))
+	var error: Error = generation_thread.start(_generate_world_region_data.bind(region, terrain_seed, max_height, water_level))
 	if error != OK:
 		generation_thread_running = false
 		push_error("World generation thread could not be started: %s" % error_string(error))
@@ -471,35 +484,37 @@ func _extend_world_if_needed() -> void:
 
 	_start_next_world_generation()
 
-static func _generate_world_region_data(region: Vector4i, seed: int, height_limit: int) -> Dictionary:
+static func _generate_world_region_data(region: Vector4i, seed: int, height_limit: int, water_height: int) -> Dictionary:
 	var noise := FastNoiseLite.new()
 	noise.seed = seed
 	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	noise.frequency = 0.05
 	var positions: Array[Vector3i] = []
 	var colors: Array[Color] = []
-	var base_color := Color(0.35, 0.55, 0.28)
 	for x in range(region.x, region.y + 1):
 		for z in range(region.z, region.w + 1):
 			positions.append(Vector3i(x, BEDROCK_Y, z))
 			colors.append(BEDROCK_COLOR)
 			var h := int(round(remap(noise.get_noise_2d(x, z), -1.0, 1.0, -1.0, float(height_limit))))
-			# Nur die obersten 3 Schichten, damit nicht tausende unsichtbare Bloecke entstehen.
-			for y in range(maxi(-1, h - 2), h + 1):
+			# Lueckenlos von der untersten Ebene bis zur Oberflaeche auffuellen.
+			for y in range(-1, h + 1):
 				positions.append(Vector3i(x, y, z))
-				if y == h:
+				if y == h and h >= water_height:
 					var level := 1 + int((h + 1.0) / (height_limit + 1.0) * 2.999)
 					colors.append(_color_for_height(level))
 				else:
-					colors.append(base_color)
+					colors.append(DIRT_COLOR)
+			for y in range(h + 1, water_height + 1):
+				positions.append(Vector3i(x, y, z))
+				colors.append(WATER_COLOR)
 	return {"positions": positions, "colors": colors}
 
 static func _color_for_height(height_level: int) -> Color:
 	if height_level <= 1:
-		return Color(0.35, 0.7, 0.32)
+		return GRASS_COLOR
 	if height_level <= 2:
-		return Color(0.45, 0.62, 0.38)
-	return Color(0.6, 0.5, 0.38)
+		return HILL_COLOR
+	return ROCK_COLOR
 
 func _get_block_mesh() -> BoxMesh:
 	if block_mesh == null:
@@ -507,31 +522,64 @@ func _get_block_mesh() -> BoxMesh:
 		block_mesh.size = Vector3(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
 	return block_mesh
 
-func _get_block_texture() -> ImageTexture:
-	if block_texture == null:
-		var rng := RandomNumberGenerator.new()
-		rng.seed = 1234
+func _get_block_texture(variant: int = 0, dirt := false) -> ImageTexture:
+	var key := Vector2i(variant, int(dirt))
+	if not block_textures.has(key):
+		var noise := FastNoiseLite.new()
+		noise.seed = 1234 + variant
+		noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+		noise.frequency = 0.5 if dirt else 0.2
+		var min_v := 0.45 if dirt else 0.6
 		var img := Image.create(16, 16, false, Image.FORMAT_RGB8)
 		for px in 16:
 			for py in 16:
-				var v := rng.randf_range(0.78, 1.0)
+				var v := clampf(remap(noise.get_noise_2d(px, py), -1.0, 1.0, min_v, 1.0), min_v, 1.0)
 				img.set_pixel(px, py, Color(v, v, v))
-		block_texture = ImageTexture.create_from_image(img)
-	return block_texture
+		block_textures[key] = ImageTexture.create_from_image(img)
+	return block_textures[key]
 
-func _get_block_material(color: Color) -> StandardMaterial3D:
+func _get_block_material(color: Color, variant: int) -> StandardMaterial3D:
 	if not block_materials.has(color):
+		block_materials[color] = {}
+	var materials_for_color: Dictionary = block_materials[color]
+	if not materials_for_color.has(variant):
 		var material := StandardMaterial3D.new()
 		material.albedo_color = color
-		material.albedo_texture = _get_block_texture()
+		material.albedo_texture = _get_block_texture(variant, color == DIRT_COLOR)
 		material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 		material.roughness = 0.9
-		block_materials[color] = material
-	return block_materials[color]
+		materials_for_color[variant] = material
+	return materials_for_color[variant]
+
+func _get_water_material() -> StandardMaterial3D:
+	if water_material == null:
+		water_material = StandardMaterial3D.new()
+		water_material.albedo_color = WATER_COLOR
+		water_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		water_material.roughness = 0.2
+	return water_material
+
+# Wasser ist transparent und ohne Kollision, damit man hindurchlaufen und Bloecke darin platzieren kann.
+func _spawn_water(pos: Vector3i) -> void:
+	if blocks.has(pos) or water_blocks.has(pos):
+		return
+	var mesh := MeshInstance3D.new()
+	mesh.mesh = _get_block_mesh()
+	mesh.position = Vector3(pos.x, pos.y, pos.z)
+	mesh.material_override = _get_water_material()
+	mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mesh)
+	water_blocks[pos] = mesh
 
 func _spawn_block(pos: Vector3i, color: Color) -> void:
+	if color == WATER_COLOR:
+		_spawn_water(pos)
+		return
 	if blocks.has(pos):
 		return
+	if water_blocks.has(pos):
+		water_blocks[pos].queue_free()
+		water_blocks.erase(pos)
 
 	var body := StaticBody3D.new()
 	body.position = Vector3(pos.x, pos.y, pos.z)
@@ -541,7 +589,8 @@ func _spawn_block(pos: Vector3i, color: Color) -> void:
 	var mesh := MeshInstance3D.new()
 	mesh.mesh = _get_block_mesh()
 	mesh.position = Vector3.ZERO
-	mesh.material_override = _get_block_material(color)
+	var texture_variant := hash(pos) & 0x7fffffff
+	mesh.material_override = _get_block_material(color, texture_variant % BLOCK_TEXTURE_VARIANTS)
 
 	var shape := CollisionShape3D.new()
 	var box_shape := BoxShape3D.new()
@@ -617,15 +666,22 @@ func _physics_process(delta: float) -> void:
 			input_dir += camera.global_transform.basis.x
 	input_dir.y = 0.0
 
+	var in_water := _is_player_in_water()
+	var horizontal_speed := swim_speed if in_water else move_speed
 	if input_dir.length() > 0.0:
 		input_dir = input_dir.normalized()
-		player.velocity.x = input_dir.x * move_speed
-		player.velocity.z = input_dir.z * move_speed
+		player.velocity.x = input_dir.x * horizontal_speed
+		player.velocity.z = input_dir.z * horizontal_speed
 	else:
-		player.velocity.x = move_toward(player.velocity.x, 0.0, move_speed)
-		player.velocity.z = move_toward(player.velocity.z, 0.0, move_speed)
+		player.velocity.x = move_toward(player.velocity.x, 0.0, horizontal_speed)
+		player.velocity.z = move_toward(player.velocity.z, 0.0, horizontal_speed)
 
-	if Input.is_physical_key_pressed(KEY_SPACE) and player.is_on_floor() and not inventory_open:
+	if in_water:
+		if Input.is_physical_key_pressed(KEY_SPACE) and not inventory_open:
+			player.velocity.y = _swim_up_velocity(delta)
+		else:
+			player.velocity.y = maxf(player.velocity.y - gravity * WATER_GRAVITY_FACTOR * delta, -water_sink_speed)
+	elif Input.is_physical_key_pressed(KEY_SPACE) and player.is_on_floor() and not inventory_open:
 		player.velocity.y = jump_force
 		_play_sound("jump", 0.95, 1.05, -6.0)
 	else:
@@ -637,6 +693,22 @@ func _physics_process(delta: float) -> void:
 	step_offset = move_toward(step_offset, 0.0, STEP_SMOOTH_SPEED * delta * maxf(absf(step_offset), 0.3))
 	camera.position.y = CAMERA_HEIGHT + step_offset
 	_update_movement_sounds(delta, Vector2(player.velocity.x, player.velocity.z).length() > 0.5 * move_speed)
+
+# Wasser ist ohne Kollision; Spieler gilt als im Wasser, wenn seine Koerpermitte (Kapselmitte) in einem Wasserblock liegt.
+func _is_player_in_water() -> bool:
+	return water_blocks.has(_player_center_cell())
+
+func _player_center_cell() -> Vector3i:
+	var p := player.global_position
+	return Vector3i(roundi(p.x), roundi(p.y), roundi(p.z))
+
+# Aufstieg stoppt an der Wasseroberflaeche, sodass etwa der halbe Koerper im Wasser bleibt.
+func _swim_up_velocity(delta: float) -> float:
+	var cell := _player_center_cell()
+	if water_blocks.has(cell + Vector3i.UP):
+		return swim_speed
+	var surface_y := cell.y + 0.5 * BLOCK_SIZE - 0.02
+	return clampf((surface_y - player.global_position.y) / delta, 0.0, swim_speed)
 
 # Hebt den Spieler auf eine Stufe (bis STEP_HEIGHT), wenn die Bewegung sonst blockiert waere.
 func _try_step_up(delta: float) -> void:
