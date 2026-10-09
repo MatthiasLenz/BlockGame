@@ -1,0 +1,21 @@
+# Godot 4+ specific ignores
+.godot/
+.nomedia
+
+# Godot-specific ignores
+export.cfg
+export_credentials.cfg
+*.tmp
+*.translation
+
+# Mono / C# specific ignores (falls du C# nutzt)
+.mono/
+data_*/
+mono_crash.*.json
+
+# Export outputs
+*.exe
+*.dll
+*.pck
+*.apk
+*.aab
