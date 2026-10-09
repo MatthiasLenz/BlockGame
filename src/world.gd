@@ -1,14 +1,30 @@
 extends Node3D
 
 const WORLD_RADIUS := 40
+const WORLD_EXPANSION_TRIGGER := 16
+const WORLD_EXPANSION_SIZE := 16
 @export_range(0, 64) var max_height := 4
 const BLOCK_SIZE := 1.0
-const PLAYER_SCALE := 2.0
+const PLAYER_SCALE := 1.0
+const BEDROCK_Y := -2
+const BEDROCK_COLOR := Color(0.28, 0.29, 0.3)
 
 var blocks: Dictionary = {}
 var block_mesh: BoxMesh
 var block_texture: ImageTexture
 var block_materials: Dictionary = {}
+var world_min_x := -WORLD_RADIUS
+var world_max_x := WORLD_RADIUS
+var world_min_z := -WORLD_RADIUS
+var world_max_z := WORLD_RADIUS
+var terrain_seed := 0
+var generation_thread := Thread.new()
+var generation_thread_running := false
+var generation_queue: Array[Vector4i] = []
+var generated_positions: Array[Vector3i] = []
+var generated_colors: Array[Color] = []
+var generation_cursor := 0
+var world_initialized := false
 var highlight: MeshInstance3D
 const SOUND_VOICES := 6
 const STEP_INTERVAL := 0.25
@@ -21,7 +37,7 @@ var camera: Camera3D
 var raycast: RayCast3D
 
 var move_speed := 5.5 * PLAYER_SCALE
-const JUMP_HEIGHT := 2.5 * BLOCK_SIZE
+const JUMP_HEIGHT := 1.5 * BLOCK_SIZE
 const STEP_HEIGHT := 1.05 * BLOCK_SIZE
 var gravity := 18.0 * PLAYER_SCALE
 var jump_force := sqrt(2.0 * gravity * JUMP_HEIGHT)
@@ -66,6 +82,13 @@ func _ready() -> void:
 	_create_inventory()
 	_create_highlight()
 	_create_sound_players()
+
+func _process(_delta: float) -> void:
+	_update_world_generation()
+
+func _exit_tree() -> void:
+	if generation_thread_running:
+		generation_thread.wait_to_finish()
 
 func _create_sound_players() -> void:
 	for i in SOUND_VOICES:
@@ -386,19 +409,92 @@ func _create_lighting() -> void:
 	add_child(environment)
 
 func _build_world() -> void:
+	terrain_seed = randi()
+	_queue_world_region(world_min_x, world_max_x, world_min_z, world_max_z)
+	_start_next_world_generation()
+
+func _queue_world_region(min_x: int, max_x: int, min_z: int, max_z: int) -> void:
+	generation_queue.append(Vector4i(min_x, max_x, min_z, max_z))
+
+func _start_next_world_generation() -> void:
+	if generation_thread_running or generation_queue.is_empty():
+		return
+	var region: Vector4i = generation_queue.pop_front()
+	generation_thread_running = true
+	var error: Error = generation_thread.start(_generate_world_region_data.bind(region, terrain_seed, max_height))
+	if error != OK:
+		generation_thread_running = false
+		push_error("World generation thread could not be started: %s" % error_string(error))
+
+func _update_world_generation() -> void:
+	if generation_thread_running and not generation_thread.is_alive():
+		var result: Dictionary = generation_thread.wait_to_finish()
+		generation_thread = Thread.new()
+		generation_thread_running = false
+		generated_positions = result["positions"]
+		generated_colors = result["colors"]
+		generation_cursor = 0
+
+	var end_index := mini(generation_cursor + 512, generated_positions.size())
+	while generation_cursor < end_index:
+		_spawn_block(generated_positions[generation_cursor], generated_colors[generation_cursor])
+		generation_cursor += 1
+
+	if generation_cursor == generated_positions.size() and not generated_positions.is_empty():
+		generated_positions.clear()
+		generated_colors.clear()
+		generation_cursor = 0
+		_start_next_world_generation()
+		if not world_initialized and generation_queue.is_empty() and not generation_thread_running:
+			world_initialized = true
+
+func _extend_world_if_needed() -> void:
+	var player_x := player.global_position.x
+	var player_z := player.global_position.z
+	if player_x >= world_max_x - WORLD_EXPANSION_TRIGGER:
+		var new_max_x := world_max_x + WORLD_EXPANSION_SIZE
+		_queue_world_region(world_max_x + 1, new_max_x, world_min_z, world_max_z)
+		world_max_x = new_max_x
+	elif player_x <= world_min_x + WORLD_EXPANSION_TRIGGER:
+		var new_min_x := world_min_x - WORLD_EXPANSION_SIZE
+		_queue_world_region(new_min_x, world_min_x - 1, world_min_z, world_max_z)
+		world_min_x = new_min_x
+
+	if player_z >= world_max_z - WORLD_EXPANSION_TRIGGER:
+		var new_max_z := world_max_z + WORLD_EXPANSION_SIZE
+		_queue_world_region(world_min_x, world_max_x, world_max_z + 1, new_max_z)
+		world_max_z = new_max_z
+	elif player_z <= world_min_z + WORLD_EXPANSION_TRIGGER:
+		var new_min_z := world_min_z - WORLD_EXPANSION_SIZE
+		_queue_world_region(world_min_x, world_max_x, new_min_z, world_min_z - 1)
+		world_min_z = new_min_z
+
+	_start_next_world_generation()
+
+static func _generate_world_region_data(region: Vector4i, seed: int, height_limit: int) -> Dictionary:
 	var noise := FastNoiseLite.new()
-	noise.seed = randi()
+	noise.seed = seed
 	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
 	noise.frequency = 0.05
+	var positions: Array[Vector3i] = []
+	var colors: Array[Color] = []
 	var base_color := Color(0.35, 0.55, 0.28)
-	for x in range(-WORLD_RADIUS, WORLD_RADIUS + 1):
-		for z in range(-WORLD_RADIUS, WORLD_RADIUS + 1):
-			var h := int(round(remap(noise.get_noise_2d(x, z), -1.0, 1.0, -1.0, float(max_height))))
+	for x in range(region.x, region.y + 1):
+		for z in range(region.z, region.w + 1):
+			positions.append(Vector3i(x, BEDROCK_Y, z))
+			colors.append(BEDROCK_COLOR)
+			var h := int(round(remap(noise.get_noise_2d(x, z), -1.0, 1.0, -1.0, float(height_limit))))
 			# Nur die obersten 3 Schichten, damit nicht tausende unsichtbare Bloecke entstehen.
 			for y in range(maxi(-1, h - 2), h + 1):
-				_spawn_block(Vector3i(x, y, z), _color_for_height(1 + int((h + 1.0) / (max_height + 1.0) * 2.999)) if y == h else base_color)
+				positions.append(Vector3i(x, y, z))
+				if y == h:
+					var level := 1 + int((h + 1.0) / (height_limit + 1.0) * 2.999)
+					colors.append(_color_for_height(level))
+				else:
+					colors.append(base_color)
+	return {"positions": positions, "colors": colors}
 
-func _color_for_height(height_level: int) -> Color:
+static func _color_for_height(height_level: int) -> Color:
 	if height_level <= 1:
 		return Color(0.35, 0.7, 0.32)
 	if height_level <= 2:
@@ -505,7 +601,7 @@ func _input(event: InputEvent) -> void:
 			_place_block()
 
 func _physics_process(delta: float) -> void:
-	if player == null:
+	if player == null or not world_initialized:
 		return
 	_update_highlight()
 
@@ -537,6 +633,7 @@ func _physics_process(delta: float) -> void:
 
 	_try_step_up(delta)
 	player.move_and_slide()
+	_extend_world_if_needed()
 	step_offset = move_toward(step_offset, 0.0, STEP_SMOOTH_SPEED * delta * maxf(absf(step_offset), 0.3))
 	camera.position.y = CAMERA_HEIGHT + step_offset
 	_update_movement_sounds(delta, Vector2(player.velocity.x, player.velocity.z).length() > 0.5 * move_speed)
@@ -566,6 +663,8 @@ func _break_block() -> void:
 	if collider == null or not collider.has_meta("cell"):
 		return
 	var pos: Vector3i = collider.get_meta("cell")
+	if pos.y == BEDROCK_Y:
+		return
 	if blocks.has(pos):
 		var color: Color = collider.get_meta("color")
 		inventory[color] = inventory.get(color, 0) + 1

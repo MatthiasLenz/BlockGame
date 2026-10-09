@@ -4,4 +4,4 @@
 
 [node name="Main" type="Node3D" unique_id=675919621]
 script = ExtResource("1")
-max_height = 16
+max_height = 12
