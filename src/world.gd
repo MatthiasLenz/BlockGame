@@ -3,23 +3,33 @@ extends Node3D
 const WORLD_RADIUS := 40
 @export_range(0, 64) var max_height := 4
 const BLOCK_SIZE := 1.0
+const PLAYER_SCALE := 2.0
 
 var blocks: Dictionary = {}
 var block_mesh: BoxMesh
 var block_texture: ImageTexture
 var block_materials: Dictionary = {}
 var highlight: MeshInstance3D
-var dig_player: AudioStreamPlayer
-var place_player: AudioStreamPlayer
+const SOUND_VOICES := 6
+const STEP_INTERVAL := 0.25
+var sound_players: Array[AudioStreamPlayer] = []
+var step_timer := 0.0
+var was_on_floor := true
+var fall_speed := 0.0
 var player: CharacterBody3D
 var camera: Camera3D
 var raycast: RayCast3D
 
-var move_speed := 5.5
-var jump_force := 6.0
-var gravity := 18.0
+var move_speed := 5.5 * PLAYER_SCALE
+const JUMP_HEIGHT := 2.5 * BLOCK_SIZE
+const STEP_HEIGHT := 1.05 * BLOCK_SIZE
+var gravity := 18.0 * PLAYER_SCALE
+var jump_force := sqrt(2.0 * gravity * JUMP_HEIGHT)
 var yaw := -90.0
 var pitch := 0.0
+const CAMERA_HEIGHT := 0.7 * PLAYER_SCALE
+const STEP_SMOOTH_SPEED := 6.0
+var step_offset := 0.0
 
 const MAX_HEARTS := 10
 var health := MAX_HEARTS
@@ -36,6 +46,8 @@ var right_slots: Array[Panel] = []
 var hand: MeshInstance3D
 var hand_rest := Vector3(0.45, -0.35, -0.6)
 var hand_tween: Tween
+var holding_block := false
+var hand_state := ""
 
 const INVENTORY_SLOTS := 27
 var inventory: Dictionary = {}
@@ -53,58 +65,44 @@ func _ready() -> void:
 	_create_hand()
 	_create_inventory()
 	_create_highlight()
-	_create_dig_sound()
-	_create_place_sound()
+	_create_sound_players()
 
-func _create_dig_sound() -> void:
-	const RATE := 22050
-	var n := int(RATE * 0.25)
-	var pcm := PackedByteArray()
-	pcm.resize(n * 2)
-	var rng := RandomNumberGenerator.new()
-	rng.seed = 42
-	var lp := 0.0
-	for i in n:
-		var t := float(i) / RATE
-		lp += (rng.randf_range(-1.0, 1.0) - lp) * 0.3
-		# Gedaempftes Rauschen mit Knirsch-Modulation, dazu ein dumpfer Schlag beim Eintauchen.
-		var scrape := lp * (0.55 + 0.45 * sin(TAU * 35.0 * t)) * minf(t * 200.0, 1.0) * exp(-t * 20.0)
-		var thud := sin(TAU * 85.0 * t) * exp(-t * 65.0) * 0.6
-		var s := clampf((scrape * 1.6 + thud) * 0.7, -1.0, 1.0)
-		pcm.encode_s16(i * 2, int(s * 32767.0))
-	var wav := AudioStreamWAV.new()
-	wav.format = AudioStreamWAV.FORMAT_16_BITS
-	wav.mix_rate = RATE
-	wav.stereo = false
-	wav.data = pcm
-	dig_player = AudioStreamPlayer.new()
-	dig_player.stream = wav
-	add_child(dig_player)
+func _create_sound_players() -> void:
+	for i in SOUND_VOICES:
+		var p := AudioStreamPlayer.new()
+		add_child(p)
+		sound_players.append(p)
 
-func _create_place_sound() -> void:
-	const RATE := 22050
-	var n := int(RATE * 0.15)
-	var pcm := PackedByteArray()
-	pcm.resize(n * 2)
-	var rng := RandomNumberGenerator.new()
-	rng.seed = 7
-	var lp := 0.0
-	for i in n:
-		var t := float(i) / RATE
-		lp += (rng.randf_range(-1.0, 1.0) - lp) * 0.25
-		# Kurzer dumpfer Aufschlag mit etwas Erdrauschen.
-		var thunk := sin(TAU * 110.0 * t) * exp(-t * 35.0)
-		var dirt := lp * exp(-t * 50.0) * 0.8
-		var s := clampf((thunk + dirt) * 0.8, -1.0, 1.0)
-		pcm.encode_s16(i * 2, int(s * 32767.0))
-	var wav := AudioStreamWAV.new()
-	wav.format = AudioStreamWAV.FORMAT_16_BITS
-	wav.mix_rate = RATE
-	wav.stereo = false
-	wav.data = pcm
-	place_player = AudioStreamPlayer.new()
-	place_player.stream = wav
-	add_child(place_player)
+# Spielt einen Sound der SoundBank auf der naechsten freien Stimme ab.
+func _play_sound(id: String, pitch_min := 1.0, pitch_max := 1.0, volume_db := 0.0) -> void:
+	var stream := SoundBank.get_stream(id)
+	if stream == null:
+		return
+	var p: AudioStreamPlayer = null
+	for candidate in sound_players:
+		if not candidate.playing:
+			p = candidate
+			break
+	if p == null:
+		p = sound_players[0]
+	p.stream = stream
+	p.pitch_scale = randf_range(pitch_min, pitch_max)
+	p.volume_db = volume_db
+	p.play()
+
+func _update_movement_sounds(delta: float, moving: bool) -> void:
+	var on_floor := player.is_on_floor()
+	if on_floor and not was_on_floor and 	fall_speed > 4.0 * PLAYER_SCALE:
+			_play_sound("land", 0.9, 1.1, clampf(-12.0 + fall_speed / PLAYER_SCALE, -12.0, 0.0))
+	was_on_floor = on_floor
+	fall_speed = 0.0 if on_floor else maxf(fall_speed, -player.velocity.y)
+	if on_floor and moving:
+		step_timer -= delta
+		if step_timer <= 0.0:
+			step_timer = STEP_INTERVAL
+			_play_sound("step_grass", 0.85, 1.15, -4.0)
+	else:
+		step_timer = 0.0
 
 func _create_highlight() -> void:
 	var s := BLOCK_SIZE * 0.502
@@ -190,15 +188,31 @@ func _toggle_inventory() -> void:
 
 func _create_hand() -> void:
 	hand = MeshInstance3D.new()
-	var box := BoxMesh.new()
-	box.size = Vector3(0.18, 0.18, 0.6)
-	hand.mesh = box
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.9, 0.72, 0.55)
-	hand.material_override = mat
 	hand.position = hand_rest
-	hand.rotation_degrees = Vector3(0.0, 15.0, 0.0)
 	camera.add_child(hand)
+	_update_hand()
+
+# Zeigt den ausgewaehlten Block in der Hand, bei Werkzeugwahl wieder die Hand.
+func _update_hand() -> void:
+	var show_block: bool = holding_block and int(inventory.get(left_items[left_selected], 0)) > 0
+	var key := str(left_selected) if show_block else "hand"
+	if key == hand_state:
+		return
+	hand_state = key
+	var mat := StandardMaterial3D.new()
+	var box := BoxMesh.new()
+	if show_block:
+		box.size = Vector3(0.28, 0.28, 0.28)
+		mat.albedo_texture = _get_block_texture()
+		mat.albedo_color = left_items[left_selected]
+		mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		hand.rotation_degrees = Vector3(0.0, 30.0, 0.0)
+	else:
+		box.size = Vector3(0.18, 0.18, 0.6)
+		mat.albedo_color = Color(0.9, 0.72, 0.55)
+		hand.rotation_degrees = Vector3(0.0, 15.0, 0.0)
+	hand.mesh = box
+	hand.material_override = mat
 
 func _swing_hand() -> void:
 	if hand_tween and hand_tween.is_running():
@@ -207,6 +221,16 @@ func _swing_hand() -> void:
 	hand_tween = create_tween()
 	hand_tween.tween_property(hand, "position", hand_rest + Vector3(-0.1, 0.05, -0.4), 0.08)
 	hand_tween.tween_property(hand, "position", hand_rest, 0.12)
+
+func _place_hand() -> void:
+	if hand_tween and hand_tween.is_running():
+		hand_tween.kill()
+	hand.position = hand_rest
+	hand_tween = create_tween()
+	hand_tween.set_trans(Tween.TRANS_QUAD)
+	hand_tween.tween_property(hand, "position", hand_rest + Vector3(-0.05, -0.1, -0.15), 0.06).set_ease(Tween.EASE_OUT)
+	hand_tween.tween_property(hand, "position", hand_rest + Vector3(0.0, 0.03, 0.0), 0.08)
+	hand_tween.tween_property(hand, "position", hand_rest, 0.06)
 
 func _slot_style(selected: bool, color: Color) -> StyleBoxFlat:
 	var style := StyleBoxFlat.new()
@@ -293,6 +317,8 @@ func _draw_heart(heart: Control, index: int) -> void:
 	heart.draw_colored_polygon(PackedVector2Array([Vector2(1.5, 10), Vector2(22.5, 10), Vector2(12, 21)]), color)
 
 func _refresh_hud() -> void:
+	if hand != null:
+		_update_hand()
 	for i in left_slots.size():
 		left_slots[i].add_theme_stylebox_override("panel", _slot_style(i == left_selected, left_items[i]))
 		left_counts[i].text = str(inventory.get(left_items[i], 0))
@@ -323,19 +349,19 @@ func _build_player() -> void:
 
 	var collision := CollisionShape3D.new()
 	collision.shape = CapsuleShape3D.new()
-	collision.shape.height = 1.8
-	collision.shape.radius = 0.4
+	collision.shape.height = 1.8 * PLAYER_SCALE
+	collision.shape.radius = 0.4 * PLAYER_SCALE
 	player.add_child(collision)
 
 	camera = Camera3D.new()
-	camera.position = Vector3(0.0, 0.7, 0.0)
+	camera.position = Vector3(0.0, CAMERA_HEIGHT, 0.0)
 	camera.current = true
 	camera.near = 0.1
 	camera.far = 200.0
 	player.add_child(camera)
 
 	raycast = RayCast3D.new()
-	raycast.target_position = Vector3(0.0, 0.0, -5.0)
+	raycast.target_position = Vector3(0.0, 0.0, -5.0 * PLAYER_SCALE)
 	raycast.enabled = true
 	raycast.collide_with_bodies = true
 	raycast.collide_with_areas = false
@@ -460,9 +486,13 @@ func _input(event: InputEvent) -> void:
 		var idx: int = event.physical_keycode - KEY_1
 		if idx >= 0 and idx < left_items.size():
 			left_selected = idx
+			holding_block = true
+			_update_hand()
 			_refresh_hud()
 		elif idx >= left_items.size() and idx < left_items.size() + right_items.size():
 			right_selected = idx - left_items.size()
+			holding_block = false
+			_update_hand()
 			_refresh_hud()
 		return
 
@@ -501,10 +531,33 @@ func _physics_process(delta: float) -> void:
 
 	if Input.is_physical_key_pressed(KEY_SPACE) and player.is_on_floor() and not inventory_open:
 		player.velocity.y = jump_force
+		_play_sound("jump", 0.95, 1.05, -6.0)
 	else:
 		player.velocity.y -= gravity * delta
 
+	_try_step_up(delta)
 	player.move_and_slide()
+	step_offset = move_toward(step_offset, 0.0, STEP_SMOOTH_SPEED * delta * maxf(absf(step_offset), 0.3))
+	camera.position.y = CAMERA_HEIGHT + step_offset
+	_update_movement_sounds(delta, Vector2(player.velocity.x, player.velocity.z).length() > 0.5 * move_speed)
+
+# Hebt den Spieler auf eine Stufe (bis STEP_HEIGHT), wenn die Bewegung sonst blockiert waere.
+func _try_step_up(delta: float) -> void:
+	var motion := Vector3(player.velocity.x, 0.0, player.velocity.z) * delta
+	if not player.is_on_floor() or motion.length_squared() < 0.000001:
+		return
+	var xf := player.global_transform
+	if not player.test_move(xf, motion):
+		return
+	var up := Vector3.UP * STEP_HEIGHT
+	if player.test_move(xf, up):
+		return
+	var raised := xf.translated(up)
+	if player.test_move(raised, motion):
+		return
+	player.global_position += up
+	player.velocity.y = 0.0
+	step_offset -= STEP_HEIGHT
 
 func _break_block() -> void:
 	if raycast == null or not raycast.is_colliding():
@@ -518,8 +571,7 @@ func _break_block() -> void:
 		inventory[color] = inventory.get(color, 0) + 1
 		_refresh_inventory()
 		_refresh_hud()
-		dig_player.pitch_scale = randf_range(0.85, 1.15)
-		dig_player.play()
+		_play_sound("dig", 0.85, 1.15)
 		blocks[pos].queue_free()
 		blocks.erase(pos)
 
@@ -543,13 +595,17 @@ func _place_block() -> void:
 	if blocks.has(place_pos):
 		return
 
-	# Nur blockieren, wenn der Block die Kapsel des Spielers (Radius 0.4, Hoehe 1.8) ueberlappt.
-	var d := (Vector3(place_pos) - player.global_position).abs()
-	if d.x < 0.9 and d.y < 1.4 and d.z < 0.9:
+	# Nur blockieren, wenn der Block die Kapsel des Spielers (Radius 0.4, Hoehe 1.8, jeweils mal PLAYER_SCALE, Ursprung in der Mitte) ueberlappt.
+	# Unterhalb der Fuesse gibt es eine kleine Toleranz, damit Bloecke direkt unter dem Spieler moeglich sind.
+	var diff := Vector3(place_pos) - player.global_position
+	var half_height := 0.9 * PLAYER_SCALE
+	var half_width := 0.4 * PLAYER_SCALE + 0.5
+	var y_limit := half_height + 0.5 - 0.1 if diff.y < 0.0 else half_height + 0.5
+	if absf(diff.x) < half_width and absf(diff.y) < y_limit and absf(diff.z) < half_width:
 		return
 	_spawn_block(place_pos, color)
-	place_player.pitch_scale = randf_range(0.9, 1.1)
-	place_player.play()
+	_play_sound("place", 0.9, 1.1)
+	_place_hand()
 	inventory[color] -= 1
 	if inventory[color] <= 0:
 		inventory.erase(color)
