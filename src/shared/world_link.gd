@@ -13,10 +13,13 @@ signal welcomed(spawn_position: Vector3)
 signal blocks_received(data: PackedInt32Array)
 signal snapshot_finished
 signal inventory_received(inventory: Dictionary)
-signal players_received(ids: PackedInt32Array, positions: PackedVector3Array)
+signal players_received(ids: PackedInt32Array, positions: PackedVector3Array, looks: PackedVector2Array, held: PackedInt32Array)
+signal player_swung(id: int)
 
 # Client -> Server (nur auf dem Server ausgeloest)
-signal position_reported(pos: Vector3)
+signal position_reported(pos: Vector3, look: Vector2)
+signal swing_requested
+signal held_reported(type: int)
 signal break_requested(pos: Vector3i)
 signal place_requested(pos: Vector3i, type: int)
 
@@ -36,16 +39,32 @@ func s_snapshot_done() -> void:
 func s_inventory(inventory: Dictionary) -> void:
 	inventory_received.emit(inventory)
 
-# Positionen aller anderen Spieler (Peer-ID und Position gleich indiziert).
+# Position, Blickrichtung (x = Yaw, y = Pitch in Grad) und gehaltener Blocktyp
+# (AIR = keiner) aller anderen Spieler, gleich indiziert.
 @rpc("authority", "call_remote", "unreliable_ordered")
-func s_players(ids: PackedInt32Array, positions: PackedVector3Array) -> void:
-	if ids.size() == positions.size():
-		players_received.emit(ids, positions)
+func s_players(ids: PackedInt32Array, positions: PackedVector3Array, looks: PackedVector2Array, held: PackedInt32Array) -> void:
+	if ids.size() == positions.size() and ids.size() == looks.size() and ids.size() == held.size():
+		players_received.emit(ids, positions, looks, held)
+
+@rpc("any_peer", "call_remote", "reliable")
+func c_held(type: int) -> void:
+	if multiplayer.is_server():
+		held_reported.emit(type)
+
+# Ein anderer Spieler hat die Hand bewegt (Abbauen/Platzieren).
+@rpc("authority", "call_remote", "reliable")
+func s_swing(id: int) -> void:
+	player_swung.emit(id)
+
+@rpc("any_peer", "call_remote", "reliable")
+func c_swing() -> void:
+	if multiplayer.is_server():
+		swing_requested.emit()
 
 @rpc("any_peer", "call_remote", "unreliable_ordered")
-func c_position(pos: Vector3) -> void:
+func c_position(pos: Vector3, look: Vector2) -> void:
 	if multiplayer.is_server():
-		position_reported.emit(pos)
+		position_reported.emit(pos, look)
 
 @rpc("any_peer", "call_remote", "reliable")
 func c_break(pos: Vector3i) -> void:

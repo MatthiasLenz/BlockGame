@@ -36,6 +36,8 @@ var fall_speed := 0.0
 const REMOTE_SMOOTH_SPEED := 15.0
 var remote_players: Dictionary = {}  # Peer-ID -> Node3D
 var remote_targets: Dictionary = {}  # Peer-ID -> Vector3
+var remote_looks: Dictionary = {}  # Peer-ID -> Vector2 (Yaw, Pitch in Grad)
+var reported_held := BlockDefs.AIR
 var player: CharacterBody3D
 var camera: Camera3D
 var raycast: RayCast3D
@@ -216,9 +218,19 @@ func _create_hand() -> void:
 	camera.add_child(hand)
 	_update_hand()
 
+# Meldet dem Server den gehaltenen Block, damit andere Spieler ihn sehen.
+func _report_held(type: int) -> void:
+	if link == null or type == reported_held or not multiplayer.has_multiplayer_peer():
+		return
+	if multiplayer.multiplayer_peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	reported_held = type
+	link.c_held.rpc_id(1, type)
+
 # Zeigt den ausgewaehlten Block in der Hand, bei Werkzeugwahl wieder die Hand.
 func _update_hand() -> void:
 	var show_block: bool = holding_block and int(inventory.get(left_items[left_selected], 0)) > 0
+	_report_held(left_items[left_selected] if show_block else BlockDefs.AIR)
 	var key := str(left_selected) if show_block else "hand"
 	if key == hand_state:
 		return
@@ -402,36 +414,72 @@ func _create_player_model(own: bool) -> Node3D:
 	model.name = "Model"
 	_add_player_part(model, "Torso", Vector3(0.62, 0.78, 0.36), Vector3(0.0, 0.05, 0.0), Color(0.18, 0.48, 0.82))
 	_add_player_part(model, "LeftArm", Vector3(0.22, 0.72, 0.28), Vector3(-0.43, 0.0, 0.0), Color(0.84, 0.67, 0.52))
-	_add_player_part(model, "RightArm", Vector3(0.22, 0.72, 0.28), Vector3(0.43, 0.0, 0.0), Color(0.84, 0.67, 0.52))
+	# Der rechte Arm haengt an einem Schultergelenk, um das er schwingt.
+	var right_arm := Node3D.new()
+	right_arm.name = "RightArm"
+	right_arm.position = Vector3(0.43, 0.36, 0.0)
+	model.add_child(right_arm)
+	_add_player_part(right_arm, "Mesh", Vector3(0.22, 0.72, 0.28), Vector3(0.0, -0.36, 0.0), Color(0.84, 0.67, 0.52))
+	var held := _add_player_part(right_arm, "Held", Vector3(0.28, 0.28, 0.28), Vector3(0.0, -0.72, -0.22), Color.WHITE)
+	held.visible = false
 	_add_player_part(model, "LeftLeg", Vector3(0.28, 0.72, 0.32), Vector3(-0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
 	_add_player_part(model, "RightLeg", Vector3(0.28, 0.72, 0.32), Vector3(0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
-	_add_player_part(model, "Head", Vector3(0.46, 0.46, 0.46), Vector3(0.0, 0.68, 0.0), Color(0.84, 0.67, 0.52))
+	var head := _add_player_part(model, "Head", Vector3(0.46, 0.46, 0.46), Vector3(0.0, 0.68, 0.0), Color(0.84, 0.67, 0.52))
+	# Das Gesicht liegt vorn (-Z, Blickrichtung) am Kopf.
+	var face_z := -0.231
+	_add_player_part(head, "LeftEyeWhite", Vector3(0.11, 0.08, 0.02), Vector3(-0.1, 0.04, face_z), Color.WHITE)
+	_add_player_part(head, "RightEyeWhite", Vector3(0.11, 0.08, 0.02), Vector3(0.1, 0.04, face_z), Color.WHITE)
+	_add_player_part(head, "LeftPupil", Vector3(0.05, 0.08, 0.02), Vector3(-0.12, 0.04, face_z - 0.01), Color(0.15, 0.2, 0.45))
+	_add_player_part(head, "RightPupil", Vector3(0.05, 0.08, 0.02), Vector3(0.12, 0.04, face_z - 0.01), Color(0.15, 0.2, 0.45))
+	_add_player_part(head, "Mouth", Vector3(0.14, 0.035, 0.02), Vector3(0.0, -0.11, face_z), Color(0.45, 0.2, 0.2))
 	if own:
-		for part in model.get_children():
+		for part in model.find_children("*", "MeshInstance3D", true, false):
 			(part as MeshInstance3D).layers = 2
 	return model
 
-func _on_players_received(ids: PackedInt32Array, positions: PackedVector3Array) -> void:
+func _swing_remote_arm(id: int) -> void:
+	if not remote_players.has(id):
+		return
+	var arm: Node3D = remote_players[id].get_node("RightArm")
+	var tween := arm.create_tween()
+	tween.tween_property(arm, "rotation:x", deg_to_rad(80.0), 0.08)
+	tween.tween_property(arm, "rotation:x", 0.0, 0.12)
+
+func _set_remote_held(model: Node3D, type: int) -> void:
+	var held: MeshInstance3D = model.get_node("RightArm/Held")
+	held.visible = type != BlockDefs.AIR
+	if held.visible:
+		held.material_override = _get_block_material(type, 0)
+
+func _on_players_received(ids: PackedInt32Array, positions: PackedVector3Array, looks: PackedVector2Array, held: PackedInt32Array) -> void:
 	for id in remote_players.keys():
 		if not ids.has(id):
 			remote_players[id].queue_free()
 			remote_players.erase(id)
 			remote_targets.erase(id)
+			remote_looks.erase(id)
 	for i in ids.size():
 		var id := ids[i]
 		if not remote_players.has(id):
 			var model := _create_player_model(false)
 			model.name = "Remote%d" % id
 			model.position = positions[i]
+			model.rotation.y = deg_to_rad(looks[i].x)
 			add_child(model)
 			remote_players[id] = model
 		remote_targets[id] = positions[i]
+		remote_looks[id] = looks[i]
+		_set_remote_held(remote_players[id], held[i])
 
 func _update_remote_players(delta: float) -> void:
 	var weight := minf(1.0, REMOTE_SMOOTH_SPEED * delta)
 	for id in remote_players:
 		var model: Node3D = remote_players[id]
 		model.position = model.position.lerp(remote_targets[id], weight)
+		var look: Vector2 = remote_looks[id]
+		model.rotation.y = lerp_angle(model.rotation.y, deg_to_rad(look.x), weight)
+		var head: Node3D = model.get_node("Head")
+		head.rotation.x = lerp_angle(head.rotation.x, deg_to_rad(look.y), weight)
 
 func _add_player_part(parent: Node3D, part_name: String, size: Vector3, part_position: Vector3, color: Color) -> MeshInstance3D:
 	var part := MeshInstance3D.new()
@@ -471,6 +519,7 @@ func _connect_to_server() -> void:
 	link.snapshot_finished.connect(_on_snapshot_finished)
 	link.inventory_received.connect(_on_inventory_received)
 	link.players_received.connect(_on_players_received)
+	link.player_swung.connect(_swing_remote_arm)
 	multiplayer.connection_failed.connect(_on_connection_lost.bind("Verbindung zu %s:%d fehlgeschlagen" % [server_address, server_port]))
 	multiplayer.server_disconnected.connect(_on_connection_lost.bind("Verbindung zum Server verloren"))
 	var peer := ENetMultiplayerPeer.new()
@@ -532,7 +581,7 @@ func _send_position(delta: float) -> void:
 	position_timer += delta
 	if position_timer >= POSITION_SEND_INTERVAL:
 		position_timer = 0.0
-		link.c_position.rpc_id(1, player.global_position)
+		link.c_position.rpc_id(1, player.global_position, Vector2(yaw, pitch))
 
 func _get_block_mesh() -> BoxMesh:
 	if block_mesh == null:
@@ -662,6 +711,7 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventMouseButton and event.pressed:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			_swing_hand()
+			link.c_swing.rpc_id(1)
 			_break_block()
 			return
 		if event.button_index == MOUSE_BUTTON_RIGHT:
@@ -789,3 +839,4 @@ func _place_block() -> void:
 	link.c_place.rpc_id(1, place_pos, type)
 	_play_sound("place", 0.9, 1.1)
 	_place_hand()
+	link.c_swing.rpc_id(1)

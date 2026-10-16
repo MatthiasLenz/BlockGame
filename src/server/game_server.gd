@@ -10,6 +10,7 @@ const WORLD_EXPANSION_SIZE := 16
 const PACKET_BLOCKS := 2048
 const PACKETS_PER_FRAME := 4
 const PLAYER_SYNC_INTERVAL := 0.05
+const MIN_SWING_INTERVAL_MS := 100
 const REACH := 8.0
 const MAX_POSITION_STEP := 32.0
 const PLAYER_HALF_HEIGHT := 0.9
@@ -41,6 +42,8 @@ func _ready() -> void:
 	link.name = "WorldLink"
 	add_child(link)
 	link.position_reported.connect(_on_position_reported)
+	link.swing_requested.connect(_on_swing_requested)
+	link.held_reported.connect(_on_held_reported)
 	link.break_requested.connect(_on_break_requested)
 	link.place_requested.connect(_on_place_requested)
 
@@ -128,11 +131,20 @@ func _broadcast_player_positions() -> void:
 	for id in players:
 		var ids := PackedInt32Array()
 		var positions := PackedVector3Array()
+		var looks := PackedVector2Array()
+		var held := PackedInt32Array()
 		for other in players:
 			if other != id:
 				ids.append(other)
 				positions.append(players[other]["position"])
-		link.s_players.rpc_id(id, ids, positions)
+				looks.append(players[other]["look"])
+				held.append(players[other]["held"])
+		link.s_players.rpc_id(id, ids, positions, looks, held)
+
+func _on_held_reported(type: int) -> void:
+	var id := multiplayer.get_remote_sender_id()
+	if players.has(id) and (type == BlockDefs.AIR or BlockDefs.is_placeable(type)):
+		players[id]["held"] = type
 
 func _process(delta: float) -> void:
 	player_sync_timer += delta
@@ -157,7 +169,7 @@ func _spawn_position() -> Vector3:
 
 func _on_peer_connected(id: int) -> void:
 	var spawn := _spawn_position()
-	players[id] = {"position": spawn, "inventory": {}}
+	players[id] = {"position": spawn, "look": Vector2.ZERO, "inventory": {}, "held": BlockDefs.AIR}
 	send_queues[id] = []
 	link.s_welcome.rpc_id(id, spawn)
 	print("-> Spieler %d: Willkommen, Spawn %s" % [id, spawn])
@@ -228,15 +240,29 @@ func _extend_world_if_needed(pos: Vector3) -> void:
 		_expand_region(Vector4i(world_min_x, world_max_x, new_min_z, world_min_z - 1))
 		world_min_z = new_min_z
 
-func _on_position_reported(pos: Vector3) -> void:
+func _on_position_reported(pos: Vector3, look: Vector2) -> void:
 	var id := multiplayer.get_remote_sender_id()
-	if not players.has(id) or not (is_finite(pos.x) and is_finite(pos.y) and is_finite(pos.z)):
+	if not players.has(id) or not (is_finite(pos.x) and is_finite(pos.y) and is_finite(pos.z)) \
+			or not (is_finite(look.x) and is_finite(look.y)):
 		return
 	var player: Dictionary = players[id]
 	if pos.distance_to(player["position"]) > MAX_POSITION_STEP:
 		return
 	player["position"] = pos
+	player["look"] = Vector2(fposmod(look.x, 360.0), clampf(look.y, -89.0, 89.0))
 	_extend_world_if_needed(pos)
+
+func _on_swing_requested() -> void:
+	var id := multiplayer.get_remote_sender_id()
+	if not players.has(id):
+		return
+	var now := Time.get_ticks_msec()
+	if now - int(players[id].get("last_swing", 0)) < MIN_SWING_INTERVAL_MS:
+		return
+	players[id]["last_swing"] = now
+	for other in players:
+		if other != id:
+			link.s_swing.rpc_id(other, id)
 
 func _within_reach(player_pos: Vector3, cell: Vector3i) -> bool:
 	return player_pos.distance_to(Vector3(cell)) <= REACH
