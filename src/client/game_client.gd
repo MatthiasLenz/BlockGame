@@ -1,42 +1,30 @@
 extends Node3D
 
-const WORLD_RADIUS := 40
-const WORLD_EXPANSION_TRIGGER := 16
-const WORLD_EXPANSION_SIZE := 16
-@export_range(0, 64) var max_height := 4
-# Globale maximale Wasserhoehe (Y-Ebene des obersten Wasserblocks); wirkt nur auf neu generierte Bereiche.
-@export_range(-1, 64) var water_level := 4
 @export_range(0.0, 20.0, 0.1) var swim_speed := 3.5
 @export_range(0.0, 20.0, 0.1) var water_sink_speed := 2.5
 const BLOCK_SIZE := 1.0
 const PLAYER_SCALE := 1.0
-const BEDROCK_Y := -2
-const BEDROCK_COLOR := Color(0.28, 0.29, 0.3)
-const GRASS_COLOR := Color(0.35, 0.7, 0.32)
-const HILL_COLOR := Color(0.45, 0.62, 0.38)
-const ROCK_COLOR := Color(0.6, 0.5, 0.38)
-const DIRT_COLOR := Color(0.47, 0.33, 0.2)
-const WATER_COLOR := Color(0.2, 0.45, 0.85, 0.55)
 const WATER_GRAVITY_FACTOR := 0.3
 const BLOCK_TEXTURE_VARIANTS := 256
+const BLOCKS_PER_FRAME := 512
+const POSITION_SEND_INTERVAL := 0.05
 
+# Wird vom Launcher (main.gd) vor dem Start gesetzt.
+var server_address := "127.0.0.1"
+var server_port := WorldLink.DEFAULT_PORT
+
+# Lokale Weltansicht: Cache des Serverzustands.
 var blocks: Dictionary = {}
 var water_blocks: Dictionary = {}
 var water_material: StandardMaterial3D
 var block_mesh: BoxMesh
 var block_textures: Dictionary = {}
 var block_materials: Dictionary = {}
-var world_min_x := -WORLD_RADIUS
-var world_max_x := WORLD_RADIUS
-var world_min_z := -WORLD_RADIUS
-var world_max_z := WORLD_RADIUS
-var terrain_seed := 0
-var generation_thread := Thread.new()
-var generation_thread_running := false
-var generation_queue: Array[Vector4i] = []
-var generated_positions: Array[Vector3i] = []
-var generated_colors: Array[Color] = []
-var generation_cursor := 0
+var link: WorldLink
+var pending_packets: Array[PackedInt32Array] = []
+var pending_cursor := 0
+var snapshot_done := false
+var position_timer := 0.0
 var world_initialized := false
 var highlight: MeshInstance3D
 const SOUND_VOICES := 6
@@ -65,7 +53,7 @@ var health := MAX_HEARTS
 var hearts: Array[Control] = []
 
 # Linke Hand: Bloecke zum Platzieren, rechte Hand: Werkzeuge (nur Anzeige)
-var left_items: Array[Color] = [GRASS_COLOR, HILL_COLOR, ROCK_COLOR, DIRT_COLOR]
+var left_items: Array[int] = [BlockDefs.GRASS, BlockDefs.HILL, BlockDefs.ROCK, BlockDefs.DIRT]
 var right_items: Array[String] = ["Hand", "Pick", "Axt", "Schwert"]
 var left_selected := 0
 var right_selected := 0
@@ -87,7 +75,6 @@ var inventory_grid: GridContainer
 func _ready() -> void:
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
 	_build_player()
-	_build_world()
 	_create_lighting()
 	_create_crosshair()
 	_create_hud()
@@ -95,13 +82,10 @@ func _ready() -> void:
 	_create_inventory()
 	_create_highlight()
 	_create_sound_players()
+	_connect_to_server()
 
 func _process(_delta: float) -> void:
-	_update_world_generation()
-
-func _exit_tree() -> void:
-	if generation_thread_running:
-		generation_thread.wait_to_finish()
+	_apply_pending_blocks()
 
 func _create_sound_players() -> void:
 	for i in SOUND_VOICES:
@@ -204,15 +188,15 @@ func _create_inventory() -> void:
 func _refresh_inventory() -> void:
 	for child in inventory_grid.get_children():
 		child.queue_free()
-	var colors := inventory.keys()
+	var types := inventory.keys()
 	for i in INVENTORY_SLOTS:
 		var slot := Panel.new()
 		slot.custom_minimum_size = Vector2(56, 56)
-		var filled := i < colors.size()
-		slot.add_theme_stylebox_override("panel", _slot_style(false, colors[i] if filled else Color(0.2, 0.2, 0.22)))
+		var filled := i < types.size()
+		slot.add_theme_stylebox_override("panel", _slot_style(false, BlockDefs.color_of(types[i]) if filled else Color(0.2, 0.2, 0.22)))
 		if filled:
 			var count := Label.new()
-			count.text = str(inventory[colors[i]])
+			count.text = str(inventory[types[i]])
 			count.position = Vector2(30, 32)
 			slot.add_child(count)
 		inventory_grid.add_child(slot)
@@ -239,8 +223,8 @@ func _update_hand() -> void:
 	var box := BoxMesh.new()
 	if show_block:
 		box.size = Vector3(0.28, 0.28, 0.28)
-		mat.albedo_texture = _get_block_texture(0, left_items[left_selected] == DIRT_COLOR)
-		mat.albedo_color = left_items[left_selected]
+		mat.albedo_texture = _get_block_texture(0, left_items[left_selected] == BlockDefs.DIRT)
+		mat.albedo_color = BlockDefs.color_of(left_items[left_selected])
 		mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 		hand.rotation_degrees = Vector3(0.0, 30.0, 0.0)
 	else:
@@ -356,7 +340,7 @@ func _refresh_hud() -> void:
 	if hand != null:
 		_update_hand()
 	for i in left_slots.size():
-		left_slots[i].add_theme_stylebox_override("panel", _slot_style(i == left_selected, left_items[i]))
+		left_slots[i].add_theme_stylebox_override("panel", _slot_style(i == left_selected, BlockDefs.color_of(left_items[i])))
 		left_counts[i].text = str(inventory.get(left_items[i], 0))
 	for i in right_slots.size():
 		right_slots[i].add_theme_stylebox_override("panel", _slot_style(i == right_selected, Color(0.3, 0.3, 0.35)))
@@ -381,7 +365,7 @@ func _create_crosshair() -> void:
 func _build_player() -> void:
 	player = CharacterBody3D.new()
 	player.name = "Player"
-	player.position = Vector3(0.0, max_height + 4.0, 8.0)
+	player.position = Vector3(0.0, 20.0, 8.0)
 
 	var collision := CollisionShape3D.new()
 	collision.shape = CapsuleShape3D.new()
@@ -421,100 +405,76 @@ func _create_lighting() -> void:
 	environment.environment = env
 	add_child(environment)
 
-func _build_world() -> void:
-	terrain_seed = randi()
-	_queue_world_region(world_min_x, world_max_x, world_min_z, world_max_z)
-	_start_next_world_generation()
-
-func _queue_world_region(min_x: int, max_x: int, min_z: int, max_z: int) -> void:
-	generation_queue.append(Vector4i(min_x, max_x, min_z, max_z))
-
-func _start_next_world_generation() -> void:
-	if generation_thread_running or generation_queue.is_empty():
-		return
-	var region: Vector4i = generation_queue.pop_front()
-	generation_thread_running = true
-	var error: Error = generation_thread.start(_generate_world_region_data.bind(region, terrain_seed, max_height, water_level))
+func _connect_to_server() -> void:
+	link = WorldLink.new()
+	link.name = "WorldLink"
+	add_child(link)
+	link.welcomed.connect(_on_welcomed)
+	link.blocks_received.connect(_on_blocks_received)
+	link.snapshot_finished.connect(_on_snapshot_finished)
+	link.inventory_received.connect(_on_inventory_received)
+	multiplayer.connection_failed.connect(_on_connection_lost.bind("Verbindung zu %s:%d fehlgeschlagen" % [server_address, server_port]))
+	multiplayer.server_disconnected.connect(_on_connection_lost.bind("Verbindung zum Server verloren"))
+	var peer := ENetMultiplayerPeer.new()
+	var error := peer.create_client(server_address, server_port)
 	if error != OK:
-		generation_thread_running = false
-		push_error("World generation thread could not be started: %s" % error_string(error))
+		_on_connection_lost("Client konnte nicht gestartet werden: %s" % error_string(error))
+		return
+	multiplayer.multiplayer_peer = peer
 
-func _update_world_generation() -> void:
-	if generation_thread_running and not generation_thread.is_alive():
-		var result: Dictionary = generation_thread.wait_to_finish()
-		generation_thread = Thread.new()
-		generation_thread_running = false
-		generated_positions = result["positions"]
-		generated_colors = result["colors"]
-		generation_cursor = 0
+func _on_connection_lost(message: String) -> void:
+	push_error(message)
+	get_tree().quit(1)
 
-	var end_index := mini(generation_cursor + 512, generated_positions.size())
-	while generation_cursor < end_index:
-		_spawn_block(generated_positions[generation_cursor], generated_colors[generation_cursor])
-		generation_cursor += 1
+func _on_welcomed(spawn_position: Vector3) -> void:
+	player.position = spawn_position
 
-	if generation_cursor == generated_positions.size() and not generated_positions.is_empty():
-		generated_positions.clear()
-		generated_colors.clear()
-		generation_cursor = 0
-		_start_next_world_generation()
-		if not world_initialized and generation_queue.is_empty() and not generation_thread_running:
-			world_initialized = true
+func _on_blocks_received(data: PackedInt32Array) -> void:
+	if data.size() % 4 == 0:
+		pending_packets.append(data)
 
-func _extend_world_if_needed() -> void:
-	var player_x := player.global_position.x
-	var player_z := player.global_position.z
-	if player_x >= world_max_x - WORLD_EXPANSION_TRIGGER:
-		var new_max_x := world_max_x + WORLD_EXPANSION_SIZE
-		_queue_world_region(world_max_x + 1, new_max_x, world_min_z, world_max_z)
-		world_max_x = new_max_x
-	elif player_x <= world_min_x + WORLD_EXPANSION_TRIGGER:
-		var new_min_x := world_min_x - WORLD_EXPANSION_SIZE
-		_queue_world_region(new_min_x, world_min_x - 1, world_min_z, world_max_z)
-		world_min_x = new_min_x
+func _on_snapshot_finished() -> void:
+	snapshot_done = true
 
-	if player_z >= world_max_z - WORLD_EXPANSION_TRIGGER:
-		var new_max_z := world_max_z + WORLD_EXPANSION_SIZE
-		_queue_world_region(world_min_x, world_max_x, world_max_z + 1, new_max_z)
-		world_max_z = new_max_z
-	elif player_z <= world_min_z + WORLD_EXPANSION_TRIGGER:
-		var new_min_z := world_min_z - WORLD_EXPANSION_SIZE
-		_queue_world_region(world_min_x, world_max_x, new_min_z, world_min_z - 1)
-		world_min_z = new_min_z
+func _on_inventory_received(new_inventory: Dictionary) -> void:
+	inventory = new_inventory
+	_refresh_inventory()
+	_refresh_hud()
 
-	_start_next_world_generation()
+# Uebernimmt empfangene Bloecke schrittweise, damit grosse Pakete keine Ruckler verursachen.
+func _apply_pending_blocks() -> void:
+	var budget := BLOCKS_PER_FRAME
+	while budget > 0 and not pending_packets.is_empty():
+		var packet: PackedInt32Array = pending_packets[0]
+		while pending_cursor < packet.size() and budget > 0:
+			_apply_block(Vector3i(packet[pending_cursor], packet[pending_cursor + 1], packet[pending_cursor + 2]), packet[pending_cursor + 3])
+			pending_cursor += 4
+			budget -= 1
+		if pending_cursor >= packet.size():
+			pending_packets.pop_front()
+			pending_cursor = 0
+	if snapshot_done and pending_packets.is_empty():
+		world_initialized = true
 
-static func _generate_world_region_data(region: Vector4i, seed: int, height_limit: int, water_height: int) -> Dictionary:
-	var noise := FastNoiseLite.new()
-	noise.seed = seed
-	noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
-	noise.frequency = 0.05
-	var positions: Array[Vector3i] = []
-	var colors: Array[Color] = []
-	for x in range(region.x, region.y + 1):
-		for z in range(region.z, region.w + 1):
-			positions.append(Vector3i(x, BEDROCK_Y, z))
-			colors.append(BEDROCK_COLOR)
-			var h := int(round(remap(noise.get_noise_2d(x, z), -1.0, 1.0, -1.0, float(height_limit))))
-			# Lueckenlos von der untersten Ebene bis zur Oberflaeche auffuellen.
-			for y in range(-1, h + 1):
-				positions.append(Vector3i(x, y, z))
-				if y == h and h >= water_height:
-					var level := 1 + int((h + 1.0) / (height_limit + 1.0) * 2.999)
-					colors.append(_color_for_height(level))
-				else:
-					colors.append(DIRT_COLOR)
-			for y in range(h + 1, water_height + 1):
-				positions.append(Vector3i(x, y, z))
-				colors.append(WATER_COLOR)
-	return {"positions": positions, "colors": colors}
+func _apply_block(pos: Vector3i, type: int) -> void:
+	if type == BlockDefs.AIR:
+		_remove_block(pos)
+	else:
+		_spawn_block(pos, type)
 
-static func _color_for_height(height_level: int) -> Color:
-	if height_level <= 1:
-		return GRASS_COLOR
-	if height_level <= 2:
-		return HILL_COLOR
-	return ROCK_COLOR
+func _remove_block(pos: Vector3i) -> void:
+	if blocks.has(pos):
+		blocks[pos].queue_free()
+		blocks.erase(pos)
+	if water_blocks.has(pos):
+		water_blocks[pos].queue_free()
+		water_blocks.erase(pos)
+
+func _send_position(delta: float) -> void:
+	position_timer += delta
+	if position_timer >= POSITION_SEND_INTERVAL:
+		position_timer = 0.0
+		link.c_position.rpc_id(1, player.global_position)
 
 func _get_block_mesh() -> BoxMesh:
 	if block_mesh == null:
@@ -538,23 +498,23 @@ func _get_block_texture(variant: int = 0, dirt := false) -> ImageTexture:
 		block_textures[key] = ImageTexture.create_from_image(img)
 	return block_textures[key]
 
-func _get_block_material(color: Color, variant: int) -> StandardMaterial3D:
-	if not block_materials.has(color):
-		block_materials[color] = {}
-	var materials_for_color: Dictionary = block_materials[color]
-	if not materials_for_color.has(variant):
+func _get_block_material(type: int, variant: int) -> StandardMaterial3D:
+	if not block_materials.has(type):
+		block_materials[type] = {}
+	var materials_for_type: Dictionary = block_materials[type]
+	if not materials_for_type.has(variant):
 		var material := StandardMaterial3D.new()
-		material.albedo_color = color
-		material.albedo_texture = _get_block_texture(variant, color == DIRT_COLOR)
+		material.albedo_color = BlockDefs.color_of(type)
+		material.albedo_texture = _get_block_texture(variant, type == BlockDefs.DIRT)
 		material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 		material.roughness = 0.9
-		materials_for_color[variant] = material
-	return materials_for_color[variant]
+		materials_for_type[variant] = material
+	return materials_for_type[variant]
 
 func _get_water_material() -> StandardMaterial3D:
 	if water_material == null:
 		water_material = StandardMaterial3D.new()
-		water_material.albedo_color = WATER_COLOR
+		water_material.albedo_color = BlockDefs.color_of(BlockDefs.WATER)
 		water_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 		water_material.roughness = 0.2
 	return water_material
@@ -571,8 +531,8 @@ func _spawn_water(pos: Vector3i) -> void:
 	add_child(mesh)
 	water_blocks[pos] = mesh
 
-func _spawn_block(pos: Vector3i, color: Color) -> void:
-	if color == WATER_COLOR:
+func _spawn_block(pos: Vector3i, type: int) -> void:
+	if type == BlockDefs.WATER:
 		_spawn_water(pos)
 		return
 	if blocks.has(pos):
@@ -584,13 +544,13 @@ func _spawn_block(pos: Vector3i, color: Color) -> void:
 	var body := StaticBody3D.new()
 	body.position = Vector3(pos.x, pos.y, pos.z)
 	body.set_meta("cell", pos)
-	body.set_meta("color", color)
+	body.set_meta("type", type)
 
 	var mesh := MeshInstance3D.new()
 	mesh.mesh = _get_block_mesh()
 	mesh.position = Vector3.ZERO
 	var texture_variant := hash(pos) & 0x7fffffff
-	mesh.material_override = _get_block_material(color, texture_variant % BLOCK_TEXTURE_VARIANTS)
+	mesh.material_override = _get_block_material(type, texture_variant % BLOCK_TEXTURE_VARIANTS)
 
 	var shape := CollisionShape3D.new()
 	var box_shape := BoxShape3D.new()
@@ -689,7 +649,7 @@ func _physics_process(delta: float) -> void:
 
 	_try_step_up(delta)
 	player.move_and_slide()
-	_extend_world_if_needed()
+	_send_position(delta)
 	step_offset = move_toward(step_offset, 0.0, STEP_SMOOTH_SPEED * delta * maxf(absf(step_offset), 0.3))
 	camera.position.y = CAMERA_HEIGHT + step_offset
 	_update_movement_sounds(delta, Vector2(player.velocity.x, player.velocity.z).length() > 0.5 * move_speed)
@@ -735,20 +695,14 @@ func _break_block() -> void:
 	if collider == null or not collider.has_meta("cell"):
 		return
 	var pos: Vector3i = collider.get_meta("cell")
-	if pos.y == BEDROCK_Y:
+	if pos.y == BlockDefs.BEDROCK_Y or not blocks.has(pos):
 		return
-	if blocks.has(pos):
-		var color: Color = collider.get_meta("color")
-		inventory[color] = inventory.get(color, 0) + 1
-		_refresh_inventory()
-		_refresh_hud()
-		_play_sound("dig", 0.85, 1.15)
-		blocks[pos].queue_free()
-		blocks.erase(pos)
+	_play_sound("dig", 0.85, 1.15)
+	link.c_break.rpc_id(1, pos)
 
 func _place_block() -> void:
-	var color := left_items[left_selected]
-	if inventory.get(color, 0) <= 0:
+	var type := left_items[left_selected]
+	if inventory.get(type, 0) <= 0:
 		return
 	if raycast == null or not raycast.is_colliding():
 		return
@@ -774,11 +728,6 @@ func _place_block() -> void:
 	var y_limit := half_height + 0.5 - 0.1 if diff.y < 0.0 else half_height + 0.5
 	if absf(diff.x) < half_width and absf(diff.y) < y_limit and absf(diff.z) < half_width:
 		return
-	_spawn_block(place_pos, color)
+	link.c_place.rpc_id(1, place_pos, type)
 	_play_sound("place", 0.9, 1.1)
 	_place_hand()
-	inventory[color] -= 1
-	if inventory[color] <= 0:
-		inventory.erase(color)
-	_refresh_inventory()
-	_refresh_hud()
