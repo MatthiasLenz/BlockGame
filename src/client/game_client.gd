@@ -33,6 +33,9 @@ var sound_players: Array[AudioStreamPlayer] = []
 var step_timer := 0.0
 var was_on_floor := true
 var fall_speed := 0.0
+const REMOTE_SMOOTH_SPEED := 15.0
+var remote_players: Dictionary = {}  # Peer-ID -> Node3D
+var remote_targets: Dictionary = {}  # Peer-ID -> Vector3
 var player: CharacterBody3D
 var camera: Camera3D
 var raycast: RayCast3D
@@ -84,8 +87,9 @@ func _ready() -> void:
 	_create_sound_players()
 	_connect_to_server()
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	_apply_pending_blocks()
+	_update_remote_players(delta)
 
 func _create_sound_players() -> void:
 	for i in SOUND_VOICES:
@@ -367,6 +371,8 @@ func _build_player() -> void:
 	player.name = "Player"
 	player.position = Vector3(0.0, 20.0, 8.0)
 
+	player.add_child(_create_player_model(true))
+
 	var collision := CollisionShape3D.new()
 	collision.shape = CapsuleShape3D.new()
 	collision.shape.height = 1.8 * PLAYER_SCALE
@@ -378,6 +384,7 @@ func _build_player() -> void:
 	camera.current = true
 	camera.near = 0.1
 	camera.far = 200.0
+	camera.cull_mask &= ~(1 << 1)
 	player.add_child(camera)
 
 	raycast = RayCast3D.new()
@@ -388,6 +395,56 @@ func _build_player() -> void:
 	raycast.hit_from_inside = false
 	camera.add_child(raycast)
 	add_child(player)
+
+# Das eigene Modell liegt auf Render-Ebene 2, die die eigene Kamera ausblendet.
+func _create_player_model(own: bool) -> Node3D:
+	var model := Node3D.new()
+	model.name = "Model"
+	_add_player_part(model, "Torso", Vector3(0.62, 0.78, 0.36), Vector3(0.0, 0.05, 0.0), Color(0.18, 0.48, 0.82))
+	_add_player_part(model, "LeftArm", Vector3(0.22, 0.72, 0.28), Vector3(-0.43, 0.0, 0.0), Color(0.84, 0.67, 0.52))
+	_add_player_part(model, "RightArm", Vector3(0.22, 0.72, 0.28), Vector3(0.43, 0.0, 0.0), Color(0.84, 0.67, 0.52))
+	_add_player_part(model, "LeftLeg", Vector3(0.28, 0.72, 0.32), Vector3(-0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
+	_add_player_part(model, "RightLeg", Vector3(0.28, 0.72, 0.32), Vector3(0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
+	_add_player_part(model, "Head", Vector3(0.46, 0.46, 0.46), Vector3(0.0, 0.68, 0.0), Color(0.84, 0.67, 0.52))
+	if own:
+		for part in model.get_children():
+			(part as MeshInstance3D).layers = 2
+	return model
+
+func _on_players_received(ids: PackedInt32Array, positions: PackedVector3Array) -> void:
+	for id in remote_players.keys():
+		if not ids.has(id):
+			remote_players[id].queue_free()
+			remote_players.erase(id)
+			remote_targets.erase(id)
+	for i in ids.size():
+		var id := ids[i]
+		if not remote_players.has(id):
+			var model := _create_player_model(false)
+			model.name = "Remote%d" % id
+			model.position = positions[i]
+			add_child(model)
+			remote_players[id] = model
+		remote_targets[id] = positions[i]
+
+func _update_remote_players(delta: float) -> void:
+	var weight := minf(1.0, REMOTE_SMOOTH_SPEED * delta)
+	for id in remote_players:
+		var model: Node3D = remote_players[id]
+		model.position = model.position.lerp(remote_targets[id], weight)
+
+func _add_player_part(parent: Node3D, part_name: String, size: Vector3, part_position: Vector3, color: Color) -> MeshInstance3D:
+	var part := MeshInstance3D.new()
+	part.name = part_name
+	var mesh := BoxMesh.new()
+	mesh.size = size
+	part.mesh = mesh
+	part.position = part_position
+	var material := StandardMaterial3D.new()
+	material.albedo_color = color
+	part.material_override = material
+	parent.add_child(part)
+	return part
 
 func _create_lighting() -> void:
 	var sun := DirectionalLight3D.new()
@@ -413,6 +470,7 @@ func _connect_to_server() -> void:
 	link.blocks_received.connect(_on_blocks_received)
 	link.snapshot_finished.connect(_on_snapshot_finished)
 	link.inventory_received.connect(_on_inventory_received)
+	link.players_received.connect(_on_players_received)
 	multiplayer.connection_failed.connect(_on_connection_lost.bind("Verbindung zu %s:%d fehlgeschlagen" % [server_address, server_port]))
 	multiplayer.server_disconnected.connect(_on_connection_lost.bind("Verbindung zum Server verloren"))
 	var peer := ENetMultiplayerPeer.new()

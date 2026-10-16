@@ -2,6 +2,7 @@
 
 Ein kleines Minecraft-artiges Spiel mit:
 - Blockwelt
+- Einfaches blockiges Spielermodell
 - WASD-Bewegung
 - Springen
 - Maussteuerung
@@ -29,7 +30,8 @@ Eine mit dem Feature-Tag `dedicated_server` exportierte Version startet automati
 - `shared/`: Blockdefinitionen und die RPC-Schnittstelle (`WorldLink`).
 
 Aktuell sendet der Server die gesamte Welt als Pakete begrenzter Größe; Interessensverwaltung und
-Priorisierung gemäß `design.md` folgen. Andere Spieler werden noch nicht dargestellt.
+Priorisierung gemäß `design.md` folgen. Der Server sendet regelmäßig die Positionen der
+anderen Spieler, die Clients zeigen dort ein Spielermodell an.
 
 ## Hinweis
 Das Projekt ist bewusst minimal gehalten und dient als Grundlage für eigene Erweiterungen wie Biome, Inventar, Nachtmodus oder Crafting.

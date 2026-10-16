@@ -13,6 +13,7 @@ signal welcomed(spawn_position: Vector3)
 signal blocks_received(data: PackedInt32Array)
 signal snapshot_finished
 signal inventory_received(inventory: Dictionary)
+signal players_received(ids: PackedInt32Array, positions: PackedVector3Array)
 
 # Client -> Server (nur auf dem Server ausgeloest)
 signal position_reported(pos: Vector3)
@@ -34,6 +35,12 @@ func s_snapshot_done() -> void:
 @rpc("authority", "call_remote", "reliable")
 func s_inventory(inventory: Dictionary) -> void:
 	inventory_received.emit(inventory)
+
+# Positionen aller anderen Spieler (Peer-ID und Position gleich indiziert).
+@rpc("authority", "call_remote", "unreliable_ordered")
+func s_players(ids: PackedInt32Array, positions: PackedVector3Array) -> void:
+	if ids.size() == positions.size():
+		players_received.emit(ids, positions)
 
 @rpc("any_peer", "call_remote", "unreliable_ordered")
 func c_position(pos: Vector3) -> void:

@@ -9,6 +9,7 @@ const WORLD_EXPANSION_TRIGGER := 16
 const WORLD_EXPANSION_SIZE := 16
 const PACKET_BLOCKS := 2048
 const PACKETS_PER_FRAME := 4
+const PLAYER_SYNC_INTERVAL := 0.05
 const REACH := 8.0
 const MAX_POSITION_STEP := 32.0
 const PLAYER_HALF_HEIGHT := 0.9
@@ -31,6 +32,8 @@ var world_max_z := WORLD_RADIUS
 var players: Dictionary = {}  # Peer-ID -> {"position": Vector3, "inventory": Dictionary}
 var send_queues: Dictionary = {}  # Peer-ID -> Array aus PackedInt32Array bzw. null (Snapshot-Ende)
 var link: WorldLink
+var player_sync_timer := 0.0
+var console_thread: Thread
 
 func _ready() -> void:
 	terrain_seed = randi()
@@ -53,8 +56,89 @@ func _ready() -> void:
 	multiplayer.peer_connected.connect(_on_peer_connected)
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	print("Server laeuft auf Port %d (Seed %d, %d Bloecke)" % [port, terrain_seed, blocks.size() + water.size()])
+	if DisplayServer.get_name() == "headless":
+		console_thread = Thread.new()
+		console_thread.start(_console_loop)
+		print("Konsole bereit, 'help' zeigt die Befehle")
 
-func _process(_delta: float) -> void:
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		_quit()
+
+# Der blockierende stdin-Thread verhindert ein reguläres Engine-Herunterfahren;
+# deshalb wird der Prozess nach dem Freigeben des Ports beendet.
+func _quit() -> void:
+	_shutdown()
+	if console_thread != null:
+		OS.kill(OS.get_process_id())
+	get_tree().quit()
+
+# Liest stdin in einem eigenen Thread, damit die Eingabe das Spiel nicht blockiert
+# und Logausgaben weiterhin erscheinen. Der Thread wird nicht beigetreten, da das
+# Lesen blockiert; er endet mit dem Prozess.
+func _console_loop() -> void:
+	while true:
+		var input := OS.read_string_from_stdin(1024)
+		if input.is_empty():
+			return # stdin geschlossen
+		for line in input.split("\n", false):
+			line = line.strip_edges()
+			if not line.is_empty():
+				_run_command.call_deferred(line)
+
+func _run_command(line: String) -> void:
+	var parts := line.split(" ", false)
+	var args := parts.slice(1)
+	match parts[0].to_lower():
+		"help":
+			print("Befehle: help, status, players, kick <id>, stop (auch: quit, exit)")
+		"status":
+			print("Port %d, Seed %d, %d Spieler, %d Bloecke, Welt X %d..%d Z %d..%d" % [
+				port, terrain_seed, players.size(), blocks.size() + water.size(),
+				world_min_x, world_max_x, world_min_z, world_max_z])
+		"players":
+			if players.is_empty():
+				print("Keine Spieler verbunden")
+			for id in players:
+				print("Spieler %d bei %s" % [id, players[id]["position"]])
+		"kick":
+			if args.size() != 1 or not args[0].is_valid_int() or not players.has(args[0].to_int()):
+				print("Verwendung: kick <id> (gueltige Spieler-ID)")
+			else:
+				multiplayer.multiplayer_peer.disconnect_peer(args[0].to_int())
+		"stop", "quit", "exit":
+			print("Server wird beendet")
+			_quit()
+		_:
+			print("Unbekannter Befehl '%s', 'help' zeigt die Befehle" % parts[0])
+
+func _exit_tree() -> void:
+	_shutdown()
+
+# Trennt alle Clients und gibt den Port frei.
+func _shutdown() -> void:
+	var peer := multiplayer.multiplayer_peer
+	if peer == null or peer is OfflineMultiplayerPeer:
+		return
+	peer.close()
+	multiplayer.multiplayer_peer = null
+	print("Server beendet, Port %d freigegeben" % port)
+
+func _broadcast_player_positions() -> void:
+	for id in players:
+		var ids := PackedInt32Array()
+		var positions := PackedVector3Array()
+		for other in players:
+			if other != id:
+				ids.append(other)
+				positions.append(players[other]["position"])
+		link.s_players.rpc_id(id, ids, positions)
+
+func _process(delta: float) -> void:
+	player_sync_timer += delta
+	if player_sync_timer >= PLAYER_SYNC_INTERVAL:
+		player_sync_timer = 0.0
+		_broadcast_player_positions()
 	for id in send_queues:
 		var queue: Array = send_queues[id]
 		var sent := 0
