@@ -37,6 +37,11 @@ const REMOTE_SMOOTH_SPEED := 15.0
 var remote_players: Dictionary = {}  # Peer-ID -> Node3D
 var remote_targets: Dictionary = {}  # Peer-ID -> Vector3
 var remote_looks: Dictionary = {}  # Peer-ID -> Vector2 (Yaw, Pitch in Grad)
+var remote_walk: Dictionary = {}  # Peer-ID -> Vector2 (Phase, Ausschlag)
+const WALK_MIN_SPEED := 0.3
+const WALK_BLEND_SPEED := 6.0
+const WALK_CYCLE_RATE := 1.8
+const WALK_SWING_DEGREES := 40.0
 var reported_held := BlockDefs.AIR
 var player: CharacterBody3D
 var camera: Camera3D
@@ -76,17 +81,81 @@ var inventory: Dictionary = {}
 var inventory_open := false
 var inventory_panel: PanelContainer
 var inventory_grid: GridContainer
+var connection_menu: PanelContainer
+var server_address_input: LineEdit
+var connection_status: Label
+var connect_button: Button
+var client_initialized := false
+var connection_established := false
 
 func _ready() -> void:
-	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
-	_build_player()
-	_create_lighting()
-	_create_crosshair()
-	_create_hud()
-	_create_hand()
-	_create_inventory()
-	_create_highlight()
-	_create_sound_players()
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	_create_connection_menu()
+
+func _create_connection_menu() -> void:
+	var layer := CanvasLayer.new()
+	layer.layer = 20
+	add_child(layer)
+
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	layer.add_child(root)
+
+	connection_menu = PanelContainer.new()
+	connection_menu.set_anchors_preset(Control.PRESET_CENTER)
+	connection_menu.offset_left = -220.0
+	connection_menu.offset_top = -105.0
+	connection_menu.offset_right = 220.0
+	connection_menu.offset_bottom = 105.0
+	root.add_child(connection_menu)
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 10)
+	connection_menu.add_child(box)
+
+	var title := Label.new()
+	title.text = "Mit einem Server verbinden"
+	box.add_child(title)
+
+	server_address_input = LineEdit.new()
+	server_address_input.text = server_address
+	server_address_input.placeholder_text = "Serveradresse oder IP-Adresse"
+	server_address_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	server_address_input.text_submitted.connect(_on_server_address_submitted)
+	box.add_child(server_address_input)
+
+	connect_button = Button.new()
+	connect_button.text = "Verbinden"
+	connect_button.pressed.connect(_on_connect_pressed)
+	box.add_child(connect_button)
+
+	connection_status = Label.new()
+	connection_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(connection_status)
+	server_address_input.grab_focus()
+
+func _on_server_address_submitted(_text: String) -> void:
+	_on_connect_pressed()
+
+func _on_connect_pressed() -> void:
+	server_address = server_address_input.text.strip_edges()
+	if server_address.is_empty():
+		connection_status.text = "Bitte gib eine Serveradresse ein."
+		server_address_input.grab_focus()
+		return
+
+	connection_status.text = "Verbinde mit %s:%d ..." % [server_address, server_port]
+	connect_button.disabled = true
+	if not client_initialized:
+		client_initialized = true
+		_build_player()
+		_create_lighting()
+		_create_crosshair()
+		_create_hud()
+		_create_hand()
+		_create_inventory()
+		_create_highlight()
+		_create_sound_players()
 	_connect_to_server()
 
 func _process(delta: float) -> void:
@@ -413,17 +482,20 @@ func _create_player_model(own: bool) -> Node3D:
 	var model := Node3D.new()
 	model.name = "Model"
 	_add_player_part(model, "Torso", Vector3(0.62, 0.78, 0.36), Vector3(0.0, 0.05, 0.0), Color(0.18, 0.48, 0.82))
-	_add_player_part(model, "LeftArm", Vector3(0.22, 0.72, 0.28), Vector3(-0.43, 0.0, 0.0), Color(0.84, 0.67, 0.52))
-	# Der rechte Arm haengt an einem Schultergelenk, um das er schwingt.
+	_add_player_limb(model, "LeftArm", Vector3(-0.43, 0.36, 0.0), Vector3(0.22, 0.72, 0.28), Color(0.84, 0.67, 0.52))
+	# Der rechte Arm hat zwei Gelenke: aussen das Gehpendeln, innen das Schwingen beim Abbauen/Platzieren.
+	var right_arm_walk := Node3D.new()
+	right_arm_walk.name = "RightArmWalk"
+	right_arm_walk.position = Vector3(0.43, 0.36, 0.0)
+	model.add_child(right_arm_walk)
 	var right_arm := Node3D.new()
 	right_arm.name = "RightArm"
-	right_arm.position = Vector3(0.43, 0.36, 0.0)
-	model.add_child(right_arm)
+	right_arm_walk.add_child(right_arm)
 	_add_player_part(right_arm, "Mesh", Vector3(0.22, 0.72, 0.28), Vector3(0.0, -0.36, 0.0), Color(0.84, 0.67, 0.52))
 	var held := _add_player_part(right_arm, "Held", Vector3(0.28, 0.28, 0.28), Vector3(0.0, -0.72, -0.22), Color.WHITE)
 	held.visible = false
-	_add_player_part(model, "LeftLeg", Vector3(0.28, 0.72, 0.32), Vector3(-0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
-	_add_player_part(model, "RightLeg", Vector3(0.28, 0.72, 0.32), Vector3(0.17, -0.55, 0.0), Color(0.22, 0.27, 0.38))
+	_add_player_limb(model, "LeftLeg", Vector3(-0.17, -0.19, 0.0), Vector3(0.28, 0.72, 0.32), Color(0.22, 0.27, 0.38))
+	_add_player_limb(model, "RightLeg", Vector3(0.17, -0.19, 0.0), Vector3(0.28, 0.72, 0.32), Color(0.22, 0.27, 0.38))
 	var head := _add_player_part(model, "Head", Vector3(0.46, 0.46, 0.46), Vector3(0.0, 0.68, 0.0), Color(0.84, 0.67, 0.52))
 	# Das Gesicht liegt vorn (-Z, Blickrichtung) am Kopf.
 	var face_z := -0.231
@@ -440,13 +512,13 @@ func _create_player_model(own: bool) -> Node3D:
 func _swing_remote_arm(id: int) -> void:
 	if not remote_players.has(id):
 		return
-	var arm: Node3D = remote_players[id].get_node("RightArm")
+	var arm: Node3D = remote_players[id].get_node("RightArmWalk/RightArm")
 	var tween := arm.create_tween()
 	tween.tween_property(arm, "rotation:x", deg_to_rad(80.0), 0.08)
 	tween.tween_property(arm, "rotation:x", 0.0, 0.12)
 
 func _set_remote_held(model: Node3D, type: int) -> void:
-	var held: MeshInstance3D = model.get_node("RightArm/Held")
+	var held: MeshInstance3D = model.get_node("RightArmWalk/RightArm/Held")
 	held.visible = type != BlockDefs.AIR
 	if held.visible:
 		held.material_override = _get_block_material(type, 0)
@@ -458,6 +530,7 @@ func _on_players_received(ids: PackedInt32Array, positions: PackedVector3Array, 
 			remote_players.erase(id)
 			remote_targets.erase(id)
 			remote_looks.erase(id)
+			remote_walk.erase(id)
 	for i in ids.size():
 		var id := ids[i]
 		if not remote_players.has(id):
@@ -475,11 +548,35 @@ func _update_remote_players(delta: float) -> void:
 	var weight := minf(1.0, REMOTE_SMOOTH_SPEED * delta)
 	for id in remote_players:
 		var model: Node3D = remote_players[id]
+		var previous := model.position
 		model.position = model.position.lerp(remote_targets[id], weight)
+		_animate_walk(id, model, Vector2(model.position.x - previous.x, model.position.z - previous.z).length() / maxf(delta, 0.0001), delta)
 		var look: Vector2 = remote_looks[id]
 		model.rotation.y = lerp_angle(model.rotation.y, deg_to_rad(look.x), weight)
 		var head: Node3D = model.get_node("Head")
 		head.rotation.x = lerp_angle(head.rotation.x, deg_to_rad(look.y), weight)
+
+# Pendelt Arme und Beine gegenlaeufig, solange sich das Modell horizontal bewegt.
+func _animate_walk(id: int, model: Node3D, speed: float, delta: float) -> void:
+	var state: Vector2 = remote_walk.get(id, Vector2.ZERO)  # x = Phase, y = Ausschlag 0..1
+	var moving := speed > WALK_MIN_SPEED
+	state.y = move_toward(state.y, 1.0 if moving else 0.0, WALK_BLEND_SPEED * delta)
+	if moving:
+		state.x = fmod(state.x + minf(speed, 8.0) * WALK_CYCLE_RATE * delta, TAU)
+	remote_walk[id] = state
+	var swing := sin(state.x) * state.y * deg_to_rad(WALK_SWING_DEGREES)
+	model.get_node("LeftLeg").rotation.x = swing
+	model.get_node("RightLeg").rotation.x = -swing
+	model.get_node("LeftArm").rotation.x = -swing
+	model.get_node("RightArmWalk").rotation.x = swing
+
+func _add_player_limb(parent: Node3D, limb_name: String, joint_position: Vector3, size: Vector3, color: Color) -> Node3D:
+	var joint := Node3D.new()
+	joint.name = limb_name
+	joint.position = joint_position
+	parent.add_child(joint)
+	_add_player_part(joint, "Mesh", size, Vector3(0.0, -size.y * 0.5, 0.0), color)
+	return joint
 
 func _add_player_part(parent: Node3D, part_name: String, size: Vector3, part_position: Vector3, color: Color) -> MeshInstance3D:
 	var part := MeshInstance3D.new()
@@ -511,27 +608,49 @@ func _create_lighting() -> void:
 	add_child(environment)
 
 func _connect_to_server() -> void:
-	link = WorldLink.new()
-	link.name = "WorldLink"
-	add_child(link)
-	link.welcomed.connect(_on_welcomed)
-	link.blocks_received.connect(_on_blocks_received)
-	link.snapshot_finished.connect(_on_snapshot_finished)
-	link.inventory_received.connect(_on_inventory_received)
-	link.players_received.connect(_on_players_received)
-	link.player_swung.connect(_swing_remote_arm)
-	multiplayer.connection_failed.connect(_on_connection_lost.bind("Verbindung zu %s:%d fehlgeschlagen" % [server_address, server_port]))
-	multiplayer.server_disconnected.connect(_on_connection_lost.bind("Verbindung zum Server verloren"))
+	if link == null:
+		link = WorldLink.new()
+		link.name = "WorldLink"
+		add_child(link)
+		link.welcomed.connect(_on_welcomed)
+		link.blocks_received.connect(_on_blocks_received)
+		link.snapshot_finished.connect(_on_snapshot_finished)
+		link.inventory_received.connect(_on_inventory_received)
+		link.players_received.connect(_on_players_received)
+		link.player_swung.connect(_swing_remote_arm)
 	var peer := ENetMultiplayerPeer.new()
 	var error := peer.create_client(server_address, server_port)
 	if error != OK:
-		_on_connection_lost("Client konnte nicht gestartet werden: %s" % error_string(error))
+		_show_connection_error("Client konnte nicht gestartet werden: %s" % error_string(error))
 		return
+	multiplayer.connection_failed.connect(_on_connection_failed, CONNECT_ONE_SHOT)
+	multiplayer.connected_to_server.connect(_on_connected_to_server, CONNECT_ONE_SHOT)
+	if not multiplayer.server_disconnected.is_connected(_on_server_disconnected):
+		multiplayer.server_disconnected.connect(_on_server_disconnected)
 	multiplayer.multiplayer_peer = peer
 
-func _on_connection_lost(message: String) -> void:
-	push_error(message)
+func _on_connected_to_server() -> void:
+	connection_established = true
+	connection_menu.hide()
+	connection_status.text = ""
+	connect_button.disabled = false
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+func _on_connection_failed() -> void:
+	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	_show_connection_error("Verbindung zu %s:%d fehlgeschlagen" % [server_address, server_port])
+
+func _on_server_disconnected() -> void:
+	push_error("Verbindung zum Server verloren")
 	get_tree().quit(1)
+
+func _show_connection_error(message: String) -> void:
+	connection_established = false
+	connection_menu.show()
+	connection_status.text = message
+	connect_button.disabled = false
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+	push_error(message)
 
 func _on_welcomed(spawn_position: Vector3) -> void:
 	player.position = spawn_position
@@ -670,6 +789,8 @@ func _spawn_block(pos: Vector3i, type: int) -> void:
 	blocks[pos] = body
 
 func _input(event: InputEvent) -> void:
+	if not connection_established:
+		return
 	if event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_I:
 		_toggle_inventory()
 		return
@@ -718,7 +839,7 @@ func _input(event: InputEvent) -> void:
 			_place_block()
 
 func _physics_process(delta: float) -> void:
-	if player == null or not world_initialized:
+	if not connection_established or player == null or not world_initialized:
 		return
 	_update_highlight()
 
